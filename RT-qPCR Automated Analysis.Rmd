@@ -191,7 +191,7 @@ server <- function(input, output, session) {
   # Creates new dataframe with columns for dCT, ddCT, and pwr2
   analyzedData <- eventReactive(input$processBtn, {
     
-    print("analyze button!")
+    print("analyze button MORE!")
     
     req(combinedData(), geneTargetNames(), HKgeneName(), control_groupName()) # ensure all data is present
     
