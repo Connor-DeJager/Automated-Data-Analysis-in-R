@@ -1,72 +1,22 @@
----
-title: "RT-qPCR Automated Analysis"
-author: "Connor DeJager"
-date: "2/13/2024"
-output: html_document
-runtime: shiny
----
-
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
-# Package Installation
-```{r}
-install.packages("readxl")
-install.packages("plyr")
-install.packages("ggplot2")
-install.packages("data.table")
-install.packages("shiny")
-install.packages("DT")
-install.packages("dplyr")
-install.packages("rlang")
-install.packages("ggsignif")
-install.packages("outliers")
-```
-
-
-# Load Relevant Libraries
-```{r}
-library(tidyverse)
-library(readxl)
-#library(plyr)
-library(dplyr)
-library(ggplot2)
-library(data.table)
-library(shiny)
-library(DT)
-library(rlang)
-library(ggsignif)
-library(outliers)
-```
-
-# Main Code
-```{r}
+```{r, echo = FALSE, results = 'asis'}
 
 ## DEFINE SHINY UI ######  
-ui <- fluidPage(
+ui2 <- fluidPage(
   titlePanel("RT-qPCR Data Analysis"),
   tabsetPanel(
-    tabPanel("Upload Data Files",
+    tabPanel("Upload Data and Set Parameters",
              sidebarLayout(
                sidebarPanel(
-                 fileInput("fileUpload1", "Choose .xls File 1", accept = c(".xls")),
-                 fileInput("fileUpload2", "Choose .xls File 2", accept = c(".xls"))               
-                 ),
+                 fileInput("fileUpload1", "Choose .xls File 1", accept = c(".xls", ".xlsx")),
+                 fileInput("fileUpload2", "Choose .xls File 2", accept = c(".xls", ".xlsx")),
+                 hr(), 
+                 selectInput("HKgene", "Housekeeping Gene:", choices = NULL),
+                 textOutput("geneTargetsDisplay"),
+                 br(),
+                 selectInput("control_group", "Control Group:", choices = NULL),
+                ),
                mainPanel(
                  DT::dataTableOutput("contentsPreview")
-               )
-             )
-    ),
-    tabPanel("Specify Gene Targets, Control Group",
-             sidebarLayout(
-               sidebarPanel(
-                 numericInput("numTargets", "Number of Gene Targets:", min = 1, value = 2),
-                 textInput("HKgene", "Housekeeping Gene Name: "),
-                 textInput("control_group", "Control Group Name (probably PBS): ")
-               ),
-               mainPanel(
-                 uiOutput("targetNamesInput")
                )
              )
     ),
@@ -76,34 +26,40 @@ ui <- fluidPage(
               )
     ),
     tabPanel("Analyzed Data Table",
-             sidebarPanel(
-               textOutput("displayHKgene"),
-               textOutput("displaycontrol_group"),
-               actionButton("processBtn", "Process Data")
-             ),
               mainPanel(
                 DT::dataTableOutput("analyzedData")
              )
     ),
     tabPanel("Outlier Removed Data Table",
-             sidebarPanel(
-               actionButton("statBtn", "Remove Outliers")
-             ),
              mainPanel(
-                DT::dataTableOutput("statDataTable")
+                h3("Data with Outliers Removed"),
+                DT::dataTableOutput("statDataTable"),
+                h3("Outliers"),
+                DT::dataTableOutput("outlierDataTable")
              )
     ),
-    tabPanel("Longer Data Table",
-             sidebarPanel(
-               actionButton("exportButton", "Export Data to .CSV")
-             ),
-             mainPanel(
-               DT::dataTableOutput("longData")
-             )
-    ),
+    #tabPanel("Longer Data Table",
+    #         sidebarPanel(
+    #           actionButton("exportButton", "Export Data to .CSV")
+    #         ),
+    #         mainPanel(
+    #           DT::dataTableOutput("longData")
+    #         )
+    #),
     tabPanel("Fold Change Boxplot",
+             sidebarPanel(
+               uiOutput("dynamic_rank_list"),
+               uiOutput("reference_select"),
+               uiOutput("gene_select")
+               ),
+             sidebarPanel(
+               textInput("plot_title", "Plot Title:", "My Plate Data"),
+             ),
              mainPanel(
-               plotOutput("foldChangePlot")
+               plotOutput("foldChangePlot"),
+               uiOutput("summary_table_title"),
+               DT::dataTableOutput("summary_table"),
+               downloadButton("exportSummary", "Export summary data to .CSV")
              )
              )
   )
@@ -115,99 +71,185 @@ ui <- fluidPage(
 server <- function(input, output, session) {
   
   ## OUTPUT MANAGEMENT ######################
-  
-  # Collects Housekeeping Gene
-  output$displayHKgene <- renderText({
-    req(input$HKgene)
-    paste("Housekeeping Gene: ", input$HKgene)
-    })
-  HKgeneName <- reactive({input$HKgene})
-  
-  #Collects Control Group Name
-  output$displaycontrol_group <- renderText({
-    req(input$control_group)
-    paste("Control Group: ", input$control_group)
-    })
-  control_groupName <- reactive({input$control_group})
-  
-  # Generates input fields for specifying gene targets
-  output$targetNamesInput <- renderUI({
-    numTargets <- max(1, input$numTargets)
-    targetInputs <- lapply(1:numTargets, function(i) {
-      textInput(paste0("target", i), sprintf("Name of Gene Target %d:", i))
-    })
-    # Combine all UI elements into a single UI output
-    do.call(tagList, targetInputs)
+
+
+  # Reactive to store selected housekeeping gene
+  HKgeneName <- reactive({
+    req(input$HKgene)  # Ensure that a housekeeping gene is selected
+    return(input$HKgene)
   })
 
-  # Stores target names in reactive geneTargetNames()
+  # Reactive to store automatically determined gene target names
   geneTargetNames <- reactive({
-    numTargets <- input$numTargets
-    # Initialize an empty vector to store gene target names
-    targetNames <- character(numTargets)
+      req(combinedData(), input$HKgene)  # Ensure that the data and housekeeping gene are available
+      combined_data <- combinedData()
+      
+      # Extract the gene names and subtract the selected housekeeping gene
+      gene_names <- colnames(combined_data)[!colnames(combined_data) %in% c("Well", "Clean_Sample_Name", "Cleaner_Sample_Name")]
+      gene_targets <- setdiff(gene_names, input$HKgene)
+      
+      return(gene_targets)
+  })
+
+  # Render the list of gene targets
+  output$geneTargetsDisplay <- renderText({
+    gene_targets <- geneTargetNames()
+    paste("Gene Targets:", paste(gene_targets, collapse = ", "))
+  })
   
-  # Loop through each input and collect its value
-    for(i in 1:numTargets) {
-      targetId <- paste0("target", i) # Construct the input ID
-      # Safely access the input and handle cases where it might not be set
-      if(!is.null(input[[targetId]])) {
-        targetNames[i] <- input[[targetId]]
-      } else {
-        targetNames[i] <- NA # Assign NA or some default value if the input is not available
-      }
+  # Reactive to store selected control group
+  control_groupName <- reactive({
+    req(input$control_group)  # Ensure that a control group is selected
+    return(input$control_group)
+  })
+
+  # Server logic to generate the dropdown options
+  observe({
+    req(combinedData())
+    combined_data <- combinedData()
+    # Check if combined_data is NULL or has issues
+    if (is.null(combined_data) || nrow(combined_data) == 0) {
+      showNotification("Data processing failed. Please check the input files.", type = "error")
+      return(NULL)
     }
-  targetNames <- targetNames[targetNames != ""] # Optional: Remove empty strings if necessary
-  return(targetNames)
+    
+    # Extract unique sample names and gene names from the data
+    sample_names <- unique(combined_data$Cleaner_Sample_Name)
+    gene_names <- colnames(combined_data)[!colnames(combined_data) %in% c("Well", "Clean_Sample_Name", "Cleaner_Sample_Name")]
+    
+        # Determine the default control group
+    default_control_group <- if ("PBS" %in% sample_names) "PBS" else sample_names[1]
+    
+    # Determine the default housekeeping gene (HK)
+    default_hk_gene <- if ("18S" %in% gene_names) {
+                        "18S"
+                      } else if ("18s" %in% gene_names) {
+                        "18s"
+                      } else {
+                        gene_names[1]
+                      }
+    
+    # Update the control group dropdown
+    updateSelectInput(session, "control_group", choices = sample_names, selected = default_control_group)
+    
+    # Update the housekeeping gene dropdown
+    updateSelectInput(session, "HKgene", choices = gene_names, selected = default_hk_gene)
+    
+  })
+  
 
   
-})
+  # ~~~
 
+  
+  # Reactive to get reordered data based on input from rank_list, pulling from statData()
+  reordered_data <- reactive({
+    req(input$ranked_groups)
+    req(statData())
+    #print("Data has been re-ordered!")
+    #print(input$ranked_groups)
+    statData()$stat_data %>%
+      filter(Cleaner_Sample_Name %in% input$ranked_groups) %>%
+      mutate(Cleaner_Sample_Name = factor(Cleaner_Sample_Name, levels = input$ranked_groups)) %>%
+      arrange(match(Cleaner_Sample_Name, input$ranked_groups))
+  })
+  
+  # Generates the UI field that allows the user to drag the desired order of the boxplots
+  observeEvent(statData(), {
+    output$dynamic_rank_list <- renderUI({
+      req(statData())
+      groups <- unique(statData()$stat_data$Cleaner_Sample_Name)
+      rank_list(
+        text = "Drag to Order Boxplot",
+        labels = groups,
+        input_id = "ranked_groups"
+      )
+    })
+  })
+  
   # Observe for data file output
   observeEvent(input$exportButton, {
     write.csv(longData(), "longData.csv", row.names = FALSE)
   })
   
+  # Select reference group for statistics
+  output$reference_select <- renderUI({
+    req(analyzedData())
+    groups <- unique(analyzedData()$Cleaner_Sample_Name)
+    selectInput("reference_select", "Select Reference Group for t Test", choices = groups, selected = control_groupName())    
+  })
   
+  # Server logic to generate the gene_select dropdown based on the gene targets
+  output$gene_select <- renderUI({
+    req(geneTargetNames())  # Ensure the gene target names are available
+    gene_targets <- geneTargetNames()
+    
+    # Generate the selectInput for gene selection
+    selectInput("gene_select", "Select Gene for Summary:", choices = gene_targets, selected = gene_targets[1])
+  })
   
   ## DATA MANIPULATION, ANALYSIS ############
   
-  # Combines data from files 1 and 2. Currently NOT  iterative for more than 2 files
-  combinedData <- reactive ({ 
+  # Pulls data, combines if two files are selected
+  combinedData <- reactive({
     req(input$fileUpload1)
     data1_raw <- read_excel(input$fileUpload1$datapath, sheet = "Results")
-    data2_raw <- read_excel(input$fileUpload2$datapath, sheet = "Results") 
     data1_clean <- cleanData(data1_raw)
-    data2_clean <- cleanData(data2_raw)
-    final_data <- merge(data1_clean, data2_clean, by = c("Well", "Clean_Sample_Name", "Cleaner_Sample_Name"), all = TRUE)
-    
+  
+    if (!is.null(input$fileUpload2)) {
+      data2_raw <- read_excel(input$fileUpload2$datapath, sheet = "Results")
+      data2_clean <- cleanData(data2_raw)
+      final_data <- merge(data1_clean, data2_clean, by = c("Well", "Clean_Sample_Name", "Cleaner_Sample_Name"), all = TRUE)
+    } else {
+      final_data <- data1_clean
+    }
+  
+    # Remove rows with any missing data
+    final_data <- final_data %>% filter(complete.cases(.))
     return(final_data)
   })
   
-
   ##########################
   ##### ANALYZED DATA ######
   ##########################
   
   # Creates new dataframe with columns for dCT, ddCT, and pwr2
-  analyzedData <- eventReactive(input$processBtn, {
-    
-    print("analyze button MORE!")
+  analyzedData <- reactive({
     
     req(combinedData(), geneTargetNames(), HKgeneName(), control_groupName()) # ensure all data is present
-    
+    print("Analyzing")
     # pulling dataset from combinedData(), filtering out blank wells
     data <- combinedData() %>% 
       filter(`Clean_Sample_Name` != "Blank") 
     
-    # getting list of targets ina vector from geneTargetNames()
+    # getting list of targets in a vector from geneTargetNames()
     targets <- geneTargetNames()
+    #print(targets)
     control <- control_groupName()
+    #print(control)
+    hk_gene <- HKgeneName()
+    #print(hk_gene)
+    
+    # Check if all targets, housekeeping gene, and control group are present in the data
+    required_columns <- c(targets, hk_gene)
+    missing_columns <- setdiff(required_columns, colnames(data))
+    
+    if (length(missing_columns) > 0) {
+      # Exit the function if any required columns are missing
+      warning(paste("The following required columns are missing in the dataset:", paste(missing_columns, collapse = ", ")))
+      return(NULL)  # Or use req(FALSE) to halt the reactive chain
+    }
+    
+    if (!control %in% data$Cleaner_Sample_Name) {
+      # Exit the function if the control group is not present in the data
+      warning(paste("Control group", control, "is not present in the dataset."))
+      return(NULL)  # Or use req(FALSE) to halt the reactive chain
+    }
     
     # For loop to generate new dCT data columns for each gene in targets
     for (gene in targets) {
-      # Observe Event to Check Function in R
+
       if (as.character(gene) %in% colnames(data)) {
-        # DELTA CT - Defining new column based on gene target and filling based on data[[gene]]
         dCT_col_name <- paste0(gene, "_dCT")
         data[[dCT_col_name]] <- as.numeric(data[[gene]]) - as.numeric(data[[HKgeneName()]])
         }
@@ -247,71 +289,82 @@ server <- function(input, output, session) {
     return(data)
   })
   
-  
   #######################
   ### STAT DATA #########
   #######################
   
-library(dplyr)
-library(outliers)
+  library(dplyr)
+  library(outliers)
 
-  statData <- eventReactive(input$statBtn, {
-  req(analyzedData())  # Ensure analyzedData is available
-
-  # Initialize an empty list to accumulate data frames
-  data_list <- list()
+  statData <- reactive({
+  req(longData())  # Ensure longData is available
+  data <- longData()  
   
   # Extract unique cleaner sample names and gene targets
-  unique_samples <- unique(analyzedData()$Cleaner_Sample_Name)
+  unique_samples <- unique(longData()$Cleaner_Sample_Name)
   unique_genes <- geneTargetNames()
   
-  counter <- 1  # Initialize a counter for indexing the data list
+  stat_data <- data.frame()
+  outlier_data <- data.frame()
+  summarized_data <- data.frame()
   
   for(sample in unique_samples) {
     for(gene in unique_genes) {
-      ddCT_col_name <- paste0(gene, "_ddCT")
       
       # Filter data for the current sample and gene, ensuring numeric conversion
-      temp_data <- analyzedData() %>%
+      temp_data <- data %>%
         filter(Cleaner_Sample_Name == sample) %>%
-        select(Cleaner_Sample_Name, everything()) %>%
-        mutate_at(vars(ddCT_col_name), list(~as.numeric(.))) %>%  # Convert to numeric
-        na.omit()  # Remove NA values
+        filter(Gene == gene)
       
-      # Apply the Grubbs test if there are enough data points
-      if(nrow(temp_data) >= 3) {
-        print(nrow(temp_data))
-        tryCatch({
-          grubbs_result <- grubbs.test(temp_data[[ddCT_col_name]], type = "two.sided")
-          # Remove outlier based on Grubbs' result
-          temp_data <- temp_data[temp_data[[ddCT_col_name]] != grubbs_result$outlier, ]
-        }, error = function(e) {
-          message("Error processing ", sample, " ", gene, " ", temp_data$well, ": ", e$message)
-        })
+      # only run Grubbs if there are 3 or more values
+      if (nrow(temp_data) > 2) {
+        grubbs_test <- grubbs.test(temp_data$ddCT, two.sided = TRUE)
+        outlier_value <- 0
+        
+      # All this executes while there is outlier in the group (p < 0.05)
+      while(grubbs_test$p.value < 0.05) {
+        
+          # Placing the outlier value in a variable based on whether the outlier is high / low
+          if (grepl("highest value", grubbs_test$alternative)) {
+            outlier_value <- max(temp_data$ddCT)
+          } else {
+            outlier_value <- min(temp_data$ddCT)
+          }
+
+          # adds outlier row to outlier_data dataframe
+          outlier_row <- temp_data %>% filter(ddCT == outlier_value)
+          outlier_data <- rbind(outlier_data, outlier_row)
+                          
+          # filters the row with the outlier out of temp data 
+          temp_data <- temp_data %>% filter(ddCT != outlier_value)
+          
+          if (nrow(temp_data) > 2) {
+            grubbs_test <- grubbs.test(temp_data$ddCT, two.sided = TRUE)
+          } else { break }
+        }
+        
       }
+      stat_data <- rbind(stat_data, temp_data)
       
-      # Accumulate the cleaned data
-      data_list[[counter]] <- temp_data
-      counter <- counter + 1
+      summary_row <- temp_data %>%
+        summarize(Cleaner_Sample_Name = unique(Cleaner_Sample_Name),
+          Gene = unique(Gene),
+          FoldChange = formatC(mean(FoldChange, na.rm = TRUE), digits=3))
+      summarized_data <- rbind(summarized_data, summary_row)
     }
   }
   
-  # Combine all items in the data list into a single data frame
-  cleaned_data <- bind_rows(data_list)
-  
-  return(cleaned_data)
+  return(list(stat_data = stat_data, outlier_data = outlier_data, summarized_data = summarized_data))
   })
 
 
-
-
-
-  
   ########################
   #### LONG DATA #########
   ########################
   longData <- reactive({
   req(analyzedData())  # Ensure analyzedData is available
+  
+  genes <- geneTargetNames()
   
   long_format <- analyzedData() %>%
     pivot_longer(
@@ -322,8 +375,26 @@ library(outliers)
     ) %>%
     mutate(Gene = str_replace(Gene, "_pwr2", "")) %>% # Cleaning up gene names to remove suffixes if names_prefix is not used
     mutate(Cleaner_Sample_Name = as.factor(Cleaner_Sample_Name))
+  
+  # Initialize ddCT column with NA values
+  long_format <- long_format %>% mutate(ddCT = NA_real_)
+  
+  # Loop through the genes to assign ddCT values dynamically
+  for (gene in genes) {
+    long_format <- long_format %>%
+      mutate(ddCT = case_when(
+        Gene == gene ~ get(paste0(gene, "_ddCT")),
+        TRUE ~ ddCT  # Keep existing value if not the current gene
+      ))
+  }
+  
+  # Remove the individual _ddCT columns
+  long_format <- long_format %>%
+    select(-matches(paste0(genes, "_ddCT", collapse = "|")))
+  
   return(long_format)
   })
+
   
   ## DATA OUPUTS FOR UI ###################
   
@@ -340,8 +411,14 @@ library(outliers)
   # Displying stat data table with outliers removed
   output$statDataTable <- DT::renderDataTable({
     req(statData())
-    statData()
+    statData()$stat_data
   })
+  
+  # Displaying data table with outliers
+  output$outlierDataTable <- DT::renderDataTable({
+    req(statData())
+    statData()$outlier_data
+  })  
   
   # Displaying long data table to confirm pivot longer worked
   output$longData <- DT::renderDataTable({
@@ -350,47 +427,229 @@ library(outliers)
   
   # Fold change boxplot
   output$foldChangePlot <- renderPlot({
-  req(longData())
-  
-  plot <- ggplot(data = longData(), aes(x = Cleaner_Sample_Name, y = FoldChange, fill = Cleaner_Sample_Name)) +
-    geom_boxplot() +
-    geom_jitter(width = 0.2, alpha = 0.5, color = "black") +  # Add jitter to show individual data points
-    labs(title = "Fold Change Across Groups for Each Gene", x = "Group", y = "2^(-ΔΔCT) Fold Change") +
-    theme_minimal() +
-    facet_wrap(~ Gene, scales = "free_x") +  # Separate plot for each gene, allow x axes to vary
-    scale_fill_viridis_d()  # Use a discrete color scale for different groups
+   req(reordered_data(), input$reference_select)  # Ensure the necessary data and inputs are available
 
-  print(plot)
+  # Calculate p-values with correct handling for each gene
+  p_values <- reordered_data() %>%
+    group_by(Gene, Cleaner_Sample_Name) %>%
+    summarise(
+      p_value = {
+        # Filter reference group data by Gene and Cleaner_Sample_Name
+        gene_name <- unique(Gene)
+        group_name <- unique(Cleaner_Sample_Name)
+
+        reference_group_data <- reordered_data() %>%
+          filter(Gene == gene_name & Cleaner_Sample_Name == input$reference_select)
+        
+        # Perform t-test
+        if (n() > 1 && nrow(reference_group_data) > 1) {
+          t_test_result <- t.test(
+            ddCT, 
+            reference_group_data$ddCT
+          )
+          #print(paste("Computed p-value:", t_test_result$p.value))
+          t_test_result$p.value
+        } else {
+          print("Not enough data, p-value set to NA")
+          NA  # Return NA if there's not enough data to perform t-test
+        }
+      }
+    ) %>%
+    ungroup()
+
+    #print("P-value calculation in renderPlot:")
+    #print(p_values)  # Print the p-values to ensure they are calculated correctly
+
+  plot <- ggplot(data = reordered_data(), aes(x = Cleaner_Sample_Name, y = FoldChange, fill = Cleaner_Sample_Name)) +
+    geom_boxplot(position = position_dodge(width = 0.75), width = 0.6) +  # Adjust width to make columns wider
+    geom_jitter(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75), alpha = 0.5, color = "black") +  # Add jitter to show individual data points
+    labs(x = " ", y = "Gene Expression Fold Change") +
+    theme_minimal() +
+    theme(axis.text = element_text(size = 10)) +
+    theme(strip.text = element_text(size = 14), legend.position = "none") +
+    facet_wrap(~ Gene, scales = "free_x") +  # Separate plot for each gene, allow x axes to vary
+    scale_fill_viridis_d()  +
+    ggtitle(input$plot_title) +  
+    theme(
+        plot.title = element_text(size = 20, face = "bold"), # Increase title size
+        axis.title.x = element_text(size = 16),              # Increase x-axis title size
+        axis.title.y = element_text(size = 16)               # Increase y-axis title size
+      ) #+ 
+    #stat_compare_means(method = "t.test", ref.group = input$reference_select, label = "p.signif", hide.ns = TRUE, size = 7)
+  
+    # Add significance markers using the calculated p-values
+  plot <- plot + 
+    geom_text(
+      data = p_values,
+      aes(
+        x = Cleaner_Sample_Name,
+        y = max(reordered_data()$FoldChange) * .8,  # Adjust y position as needed
+        label = ifelse(p_value < 0.05, "*", "")
+      ),
+      inherit.aes = FALSE,  # Ensure the correct mapping
+      size = 9, vjust = -.4
+    )
+  
+    print(plot)
   })
+  
+# Create summary dataframe with group average and t tests against the user-defined reference
+summary_data <- reactive({
+  req(statData()$stat_data)
+  req(input$gene_select)  # Ensure gene_select input is available
+  
+  summary_data <- statData()$stat_data %>%
+    filter(Gene == input$gene_select) %>%  # Filter based on selected gene
+    group_by(Cleaner_Sample_Name) %>%
+    summarise(
+      Average = formatC(mean(FoldChange, na.rm = TRUE), format = "f", digits = 4),
+      `Standard Deviation` = formatC(population_sd(FoldChange), format = "f", digits = 4)
+    )
+  
+  # Reference group data
+  reference_data <- statData()$stat_data %>%
+    filter(Cleaner_Sample_Name == input$reference_select, Gene == input$gene_select) %>%
+    pull(ddCT)
+  
+  # Calculate p-values against the reference
+  summary_data <- summary_data %>%
+    mutate(
+      `p-value (t-test)` = sapply(Cleaner_Sample_Name, function(sample) {
+        # Sample data
+        sample_data <- statData()$stat_data %>%
+          filter(Cleaner_Sample_Name == sample) %>%
+          filter(Gene == input$gene_select) %>%
+          pull(ddCT)
+        
+        # Perform t-test and get p-value
+        if (length(sample_data) > 1 && length(reference_data) > 1) {
+          t_test_result <- t.test(sample_data, reference_data)
+          p_value <- t_test_result$p.value
+          # Conditional formatting for p-value
+          formatted_p_value <- ifelse(p_value < 1e-6, 
+                                      formatC(p_value, format = "e", digits = 6), 
+                                      formatC(p_value, format = "f", digits = 6))
+        } else {
+          formatted_p_value <- NA
+        }
+        formatted_p_value
+      })
+    )
+  
+  # Run One-Way ANOVA
+  geneData <- statData()$stat_data %>%
+    filter(Gene == input$gene_select)
+  anova_result <- aov(ddCT ~ Cleaner_Sample_Name, data = geneData)
+  
+  # Perform Tukey HSD test
+  tukey_result <- TukeyHSD(anova_result)
+  
+  # Convert Tukey HSD result to a data frame
+  tukey_df <- as.data.frame(tukey_result$Cleaner_Sample_Name)
+  tukey_df$comparison <- rownames(tukey_df)  # Add comparison names as a column
+  
+  # Filter for comparisons involving the reference group
+  reference_group <- input$reference_select
+  filtered_tukey_df <- tukey_df %>%
+    filter(grepl(reference_group, comparison)) %>%
+    separate(comparison, into = c("Group1", "Group2"), sep = "-")
+  
+  # Integrate Tukey HSD p-values into summary_data
+  summary_data <- summary_data %>%
+    mutate(
+      `p-value (Tukey HSD)` = sapply(Cleaner_Sample_Name, function(sample) {
+        if (sample == reference_group) {
+          return("1")  # No comparison for the reference group itself, explicitly return "1"
+        } else {
+          # Find the exact match in filtered_tukey_df
+          match_row <- filtered_tukey_df %>%
+            filter((Group1 == sample & Group2 == reference_group) |
+                   (Group1 == reference_group & Group2 == sample))
+          
+          # Ensure only one match is found
+          if (nrow(match_row) == 1) {
+            p_value <- as.numeric(match_row$`p adj`)
+            # Conditional formatting for Tukey p-value
+            formatted_p_value <- ifelse(p_value < 1e-6, 
+                                        formatC(p_value, format = "e", digits = 6), 
+                                        formatC(p_value, format = "f", digits = 6))
+            return(formatted_p_value)
+          } else {
+            warning(paste("Unexpected match for sample:", sample))
+            return(NA_real_)  # If no match is found, return NA as numeric
+          }
+        }
+      })
+    )
+  
+  
+  # Order the Sample column based on input$ranked_samples
+  summary_data$Cleaner_Sample_Name <- factor(summary_data$Cleaner_Sample_Name, levels = input$ranked_groups)
+  
+  # Sort the summary_data by the ordered Sample column
+  summary_data <- summary_data[order(summary_data$Cleaner_Sample_Name), ]
+  
+  summary_data
+})
+
+
+  # Fold change data summarized
+  output$summary_table <- DT::renderDataTable({
+    req(summary_data())
+    datatable(summary_data())
+  })
+  
+  output$summary_table_title <- renderUI({
+    req(input$gene_select)
+    h3(paste("Summarized Results for", input$gene_select, "Gene"))
+  })
+  
+  # Download handler for summary data
+  output$exportSummary <- downloadHandler(
+    filename = function() {
+      paste("summary_data_", input$gene_select, "_", Sys.Date(), ".csv", sep = "")
+    },
+    content = function(file) {
+      write.csv(summary_data(), file, row.names = FALSE)
+    }
+  )
 
 }
 
-
 ## FUNCTIONS ####### #########
-
 cleanData <- function(data) {
   cleaned_data <- data %>%
-    filter(!is.na(.[,15])) #%>%
+    filter(!is.na(.[,15]))  # Filter out rows where the 15th column is NA
+  
+  # Set column names from the first row and remove the first row
   colnames(cleaned_data) <- as.character(cleaned_data[1,])
-  cleaned_data <- cleaned_data[-1,] %>%
+  cleaned_data <- cleaned_data[-1,]
+  
+  # Clean the Sample Name by removing isolated single numbers at the start and end
+  cleaned_data <- cleaned_data %>%
     mutate(
-      Clean_Sample_Name = gsub("\\d+\\.\\s", "", `Sample Name`),
+      Clean_Sample_Name = gsub("^\\s*\\d{1,2}\\.\\s*|^\\s*\\d{1,2}\\s+", "", `Sample Name`),   # Remove single number followed by a space at the start
+      #Cleaner_Sample_Name = gsub("\\s\\d$", "", Clean_Sample_Name), # Remove single space followed by a number at the end
       Well_Group = paste(Well, Clean_Sample_Name, sep = "_")
-      ) %>%
-    select(`Well`, `Clean_Sample_Name`, `Target Name`, `CT`) %>% 
-    mutate (
-      Cleaner_Sample_Name = gsub("\\s\\d+", "", Clean_Sample_Name),
-      )
-    cleaned_data$Well <- as.numeric(cleaned_data$Well)
-      cleaned_data <- pivot_wider(cleaned_data, names_from = `Target Name`, values_from = CT) 
+    ) %>%
+    select(`Well`, `Clean_Sample_Name`, `Target Name`, `CT`) %>%
+    mutate(
+      Cleaner_Sample_Name = gsub("\\s\\d$", "", Clean_Sample_Name)  # Additional cleaning if needed
+    ) %>%
+    filter(!grepl("Undetermined", CT)) 
+  
+  # Pivot the data to wide format
+  cleaned_data <- pivot_wider(cleaned_data, names_from = `Target Name`, values_from = CT)
+  
   return(cleaned_data)
 }
 
+population_sd <- function(x) {
+  sqrt(sum((x - mean(x, na.rm = TRUE))^2, na.rm = TRUE) / length(x[!is.na(x)]))
+}
 
-      
+
+
 # Run the application
-shinyApp(ui = ui, server = server)
+shinyApp(ui = ui2, server = server, options = list(width = '130%', height = '14000px'))
 ```
-
-
-
