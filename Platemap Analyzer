@@ -1,0 +1,804 @@
+---
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(data.table)
+library(shiny)
+library(DT)
+library(rlang)
+library(ggsignif)
+library(outliers)
+library(ggpubr)
+library(sortable)
+library(shinyMatrix)
+library(rhandsontable)
+library(shinyjs)
+library(rsconnect)
+library(renv)
+library(stats)
+
+
+
+```
+
+
+
+```{r, echo = FALSE, results = 'asis'}
+ui_PlatemapAnalyzer_V7 <- fluidPage(
+  useShinyjs(),  # Initialize shinyjs
+  
+  titlePanel("Platemap Analyzer"),
+  
+  tabsetPanel(
+    # Tab 1: Upload Data File
+    tabPanel("Upload Data File",
+  #           actionButton("fullscreenBtn", "Toggle Fullscreen"),
+             sidebarLayout(
+               sidebarPanel(
+                 fileInput("fileUpload1", "Choose .xls File", accept = c(".xls", ".xlsx")),
+                 class = "sidebar"
+               ),
+               mainPanel(
+                 DTOutput("contentsPreview"),
+                 class = "main-panel"
+               )
+             )
+    ),
+    
+    # Tab 2: Define Plate Map
+    tabPanel("Define Plate Map",
+             sidebarLayout(
+               sidebarPanel(
+                 textInput("sample_name", "Enter Sample Name", ""),
+                 actionButton("add_sample", "Add Sample"),
+                 selectInput("sample_select", "Select Sample", choices = NULL),
+                 actionButton("submit", "Apply Sample to Platemap"),
+                 checkboxInput("stdExist", "Standard Curve in Data", value = FALSE),
+                 checkboxInput("backgroundExist", "Subtract Background", value = FALSE),
+                 checkboxInput("percentReduction", "Percent Reduction", value = FALSE),
+                 checkboxInput("displayOutliers", "Display Eliminated Outliers", value = TRUE),
+                 class = "sidebar"
+               ),
+               mainPanel(
+                 rHandsontableOutput("plate_map"),
+                 
+                 conditionalPanel(
+                   condition = "input.displayOutliers == true",
+                   h3("Removed Outliers"),
+                   DTOutput("outliers_table")
+                 ),
+                 
+                 conditionalPanel(
+                   condition = "input.backgroundExist == true",
+                   actionButton("setBackground", "Set Background Value")
+                 ),
+                 
+                 conditionalPanel(
+                   condition = "input.stdExist == true",
+                   wellPanel(
+                     actionButton("select_curve_values", "Select Curve Values"),
+                     uiOutput("std_value_inputs"),
+                     DTOutput("combined_curve_table"),
+                     checkboxInput("logX", "Log Transform X Values", value = FALSE), # Checkbox for Log
+                     verbatimTextOutput('modelSummary')
+                   )
+                 ),
+                 
+                 conditionalPanel(
+                   condition = "input.percentReduction == true",
+                   wellPanel(
+                     actionButton("setZeroPercent", "Set Zero Percent Signal"),
+                     actionButton("setHundredPercent", "Set One Hundred Percent Signal")
+                   )
+                 ),
+                 class = "main-panel"
+               )
+             )
+    ),
+    
+    # Tab 3: Combined Data
+    tabPanel("Combined Data",
+             DTOutput("combined_data"),
+             class = "main-panel"
+    ),
+    
+    # Tab 4: Bar Chart
+    tabPanel("Bar Chart",
+             sidebarLayout(
+               sidebarPanel(
+                 uiOutput("dynamic_rank_list"),
+                 uiOutput("reference_select"),
+                 textInput("plot_title", "Plot Title:", "My Plate Data"),
+                 textInput("x_axis_title", "X-Axis Title:", "Sample"),
+                 textInput("y_axis_title", "Y-Axis Title:", "Value"),
+                 downloadButton("exportSummary", "Export summary data to .CSV"),
+                 class = "sidebar"
+               ),
+               mainPanel(
+                 plotOutput("barChart"),
+                 DT::dataTableOutput("summary_table"),
+                 class = "main-panel"
+               )
+             )
+    )
+  )
+)
+
+
+
+server_PlatemapAnalyzer_V7 <- function(input, output, session) {
+  sample_list <- reactiveVal(character())
+  std_curve_values <- reactiveVal(numeric())  # Reactive value for storing standard curve values
+  numStdValues <- reactiveVal(1)
+  uploaded_data <- reactiveVal(NULL)  # Separate reactive value for uploaded data
+  plate_map_data <- reactiveVal(matrix("", nrow = 8, ncol = 12))  # Reactive value for plate map
+  background_value <- reactiveVal(0)  # Reactive value to store background value
+  curve_cells <- reactiveVal(list())
+  curve_cells_df <- reactiveVal(data.frame(row = integer(), col = integer()), value = numeric())
+  row_averages <- reactiveVal(numeric())
+  removed_outliers <- reactiveVal(data.frame(Column = integer(), Value = numeric(), Row = integer(), Sample = character() ))
+  zeroSignal_value <- reactiveVal(NA)  # Reactive value to store zero percent signal
+  hundredSignal_value <- reactiveVal(NA)  # Reactive value to store hundred percent signal
+
+  observeEvent(input$fullscreenBtn, {
+    js$toggleFullScreen()  # Call the JavaScript function using shinyjs
+    })
+  
+  # Upload and display the Excel file
+  observeEvent(input$fileUpload1, {
+    req(input$fileUpload1)
+    file <- input$fileUpload1$datapath
+    data <- read_excel(file) %>%
+      select(-1) %>%
+      select(1:12) %>%
+      slice(1:8)
+    # Set the column names to 1 through 12
+    colnames(data) <- 1:12
+    # Display data
+    output$contentsPreview <- renderDT({
+      datatable(data)
+    })
+    uploaded_data(as.matrix(data))  # Store the uploaded data as a matrix for later use
+  })
+
+  # Initialize the plate map input
+  output$plate_map <- renderRHandsontable({
+    rhandsontable(plate_map_data(), colHeaders = FALSE, rowHeaders = FALSE) %>%
+      hot_context_menu(allowRowEdit = FALSE, allowColEdit = FALSE) %>%
+      hot_table(afterSelectionEnd = JS("
+        function (r, c, r2, c2) {
+          var cells = [];
+          for (var row = r; row <= r2; row++) {
+            for (var col = c; col <= c2; col++) {
+              cells.push({row: row, col: col});
+            }
+          }
+          Shiny.setInputValue('plate_map_select', cells, {priority: 'event'});
+        }
+      "))
+  })
+
+  # Function to update the plate map with specific cell types and render the output
+  update_plate_map <- function(type, row_indices, col_indices) {
+    plate_map_matrix <- plate_map_data()
+  
+    # Reset all existing labels of the given type in the plate map
+    if (type == "BACKGROUND") {
+      plate_map_matrix[plate_map_matrix == "BACKGROUND"] <- ""
+      print("ITS BACKGROUND TIME - in the LABEL RESETING")
+    } else if (type == "STANDARD") {
+      plate_map_matrix[plate_map_matrix == "STANDARD"] <- ""
+    } else if (type == "ZERO") {
+      plate_map_matrix[plate_map_matrix == "ZERO"] <- ""
+    } else if (type == "HUNDRED") {
+      plate_map_matrix[plate_map_matrix == "HUNDRED"] <- ""
+      print("OH YEAH UNO HUNDO")
+    }
+  
+    # Apply the new label to the selected cells
+    for (i in seq_along(row_indices)) {
+      row <- row_indices[i]
+      col <- col_indices[i]
+      plate_map_matrix[row, col] <- type
+    }
+  
+    plate_map_data(plate_map_matrix)  # Update the reactive plate map
+  
+    # Re-render the updated plate map to apply the changes
+    output$plate_map <- renderRHandsontable({
+      rhandsontable(plate_map_data(), colHeaders = FALSE, rowHeaders = FALSE) %>%
+        hot_context_menu(allowRowEdit = FALSE, allowColEdit = FALSE) %>%
+        hot_cols(renderer = "
+          function(instance, td, row, col, prop, value, cellProperties) {
+            Handsontable.renderers.TextRenderer.apply(this, arguments);
+            if (value == 'BACKGROUND') {
+              td.style.background = 'lightgrey';
+              td.style.color = 'black';
+            } else if (value == 'STANDARD') {
+              td.style.background = 'lightblue';
+              td.style.color = 'black';
+            } else if (value == 'ZERO') {
+              td.style.background = 'darkblue';
+              td.style.color = 'white';
+            } else if (value == 'HUNDRED') {
+              td.style.background = 'pink';
+              td.style.color = 'black';
+            }
+          }
+        ")
+    })
+  }
+  
+  # Add sample to the list
+  observeEvent(input$add_sample, {
+    req(input$sample_name)
+    current_samples <- sample_list()
+    new_sample <- input$sample_name
+    # Check if the sample already exists
+    if (new_sample %in% current_samples) {
+      return()  # Exit the function if the sample name already exists
+    }
+    updated_samples <- c(current_samples, new_sample)
+    sample_list(updated_samples)
+    updateSelectInput(session, "sample_select", choices = updated_samples)
+  })
+  
+  # Initialize the dynamic rank list
+  output$dynamic_rank_list <- renderUI({
+    req(sample_list())
+    rank_list(
+      text = "Drag to reorder samples",
+      labels = sample_list(),
+      input_id = "ranked_samples"
+    )
+  })
+
+  # Observe changes in the dynamic rank list
+  observeEvent(input$ranked_samples, {
+    ranked_samples <- input$ranked_samples
+    #print(ranked_samples)
+  })
+  
+  # Defining the selected reference for stats
+  output$reference_select <- renderUI({
+    req(final_combined_data())
+    req(sample_list())
+      groups <- sample_list()
+      selectInput("reference_select", "Select Reference Group for Statistics", choices = groups, selected = groups[1])    
+  })
+  
+  # Update the selected cells
+  observeEvent(input$submit, {
+    req(input$plate_map_select, input$sample_select)
+    cells <- input$plate_map_select
+    selected_sample <- input$sample_select
+    
+    # Print selected for debugging
+    #print("Selected Cells: ")
+    #print(cells)
+    #str(cells)
+
+    # Ensure we correctly parse the integer vector with names
+    row_indices <- cells[which(names(cells) == "row")]
+    col_indices <- cells[which(names(cells) == "col")]
+
+    # Update the plate map
+    plate_map_matrix <- plate_map_data()
+    for (i in seq_along(row_indices)) {
+      row <- row_indices[i] + 1
+      col <- col_indices[i] + 1
+      #print(paste("Row: ", row, " Col: ", col))
+
+      # Always update the cell
+      plate_map_matrix[row, col] <- selected_sample
+    }
+    plate_map_data(plate_map_matrix)  # Update the reactive plate map
+
+    selected_cells <- data.frame(row = row_indices, col = col_indices)
+    
+    # Re-render the updated plate map to apply the changes with coloring for standard and background
+    update_plate_map(selected_sample, row, col)
+  })
+
+
+  # Set Zero Percent Signal wells
+  observeEvent(input$setZeroPercent, {
+    req(input$plate_map_select)
+    cells <- input$plate_map_select
+    
+    # Ensure we correctly parse the integer vector with names
+    row_indices <- cells[which(names(cells) == "row")] + 1
+    col_indices <- cells[which(names(cells) == "col")] + 1
+    
+    selected_cells <- data.frame(row = row_indices, col = col_indices)
+    
+    # Calculate the average value for the selected zero percent signal wells
+    data_matrix <- uploaded_data()
+    zero_values <- sapply(1:length(row_indices), function(i) {
+      row <- row_indices[i]
+      col <- col_indices[i]
+      value <- as.numeric(data_matrix[row, col])
+      if (background_subtraction()) {  # Check if background subtraction is enabled
+        value <- value - background_value()
+      }
+      value
+    })
+    
+    # Store the average value as the zero percent signal
+    zeroSignal_value(mean(zero_values, na.rm = TRUE))
+    
+    # Update plate map for zero percent signal wells
+    update_plate_map("ZERO", row_indices, col_indices)
+  })
+  
+  # Set One Hundred Percent Signal wells
+  observeEvent(input$setHundredPercent, {
+    req(input$plate_map_select)
+    cells <- input$plate_map_select
+    
+    # Ensure we correctly parse the integer vector with names
+    row_indices <- cells[which(names(cells) == "row")] + 1
+    col_indices <- cells[which(names(cells) == "col")] + 1
+    
+    # Calculate the average value for the selected hundred percent signal wells
+    data_matrix <- uploaded_data()
+    hundred_values <- sapply(1:length(row_indices), function(i) {
+      row <- row_indices[i]
+      col <- col_indices[i]
+      value <- as.numeric(data_matrix[row, col])
+      if (background_subtraction()) {  # Check if background subtraction is enabled
+        value <- value - background_value()
+      }
+      value
+    })
+    
+    # Store the average value as the hundred percent signal
+    hundredSignal_value(mean(hundred_values, na.rm = TRUE))
+    
+    # Update plate map for hundred percent signal wells
+    update_plate_map("HUNDRED", row_indices, col_indices)
+  })
+  
+# Set Background wells
+observeEvent(input$setBackground, {
+  req(input$plate_map_select, uploaded_data())
+  cells <- input$plate_map_select
+  row_indices <- cells[which(names(cells) == "row")] + 1
+  col_indices <- cells[which(names(cells) == "col")] + 1
+  
+  # Calculate the background value as the average of the selected cells in the uploaded data
+  data_matrix <- uploaded_data()
+  background_values <- sapply(1:length(row_indices), function(i) {
+    row <- row_indices[i]
+    col <- col_indices[i]
+    as.numeric(data_matrix[row, col])
+  })
+  
+  # Update the background value
+  background_value(mean(background_values, na.rm = TRUE))
+  
+  # Update the plate map with BACKGROUND label
+  update_plate_map("BACKGROUND", row_indices, col_indices)
+})
+
+# Select Curve Values wells
+observeEvent(input$select_curve_values, {
+  req(input$plate_map_select, uploaded_data())
+  
+  cells <- input$plate_map_select
+  row_indices <- cells[which(names(cells) == "row")] + 1
+  col_indices <- cells[which(names(cells) == "col")] + 1
+  
+  data_matrix <- uploaded_data()
+  selected_values <- numeric(length(row_indices))
+  for (i in seq_along(row_indices)) {
+    value <- as.numeric(data_matrix[row_indices[i], col_indices[i]])
+    if (background_subtraction()) {
+      value <- value - background_value()
+    }
+    selected_values[i] <- value
+  }
+  
+  # Create a data frame with row, col, and value
+  selected_cells_df <- data.frame(row = row_indices, col = col_indices, value = selected_values)
+  
+  # Store the data frame in the reactive value
+  curve_cells_df(selected_cells_df)
+  
+  # Compute the average value for each unique row
+  row_avg <- tapply(selected_cells_df$value, selected_cells_df$row, mean)
+  row_averages(row_avg)  # Update the reactive value for row averages
+
+  numStdValues(length(unique(row_indices)))
+  numStdReplicates <- length(unique(col_indices))
+  
+  # Update the plate map with STANDARD label
+  update_plate_map("STANDARD", row_indices, col_indices)
+})
+
+
+  # Reactive expression for background subtraction checkbox
+  background_subtraction <- reactive({
+    input$backgroundExist
+  })
+
+  # Generate dynamic value input boxes for standard curve points
+  output$std_value_inputs <- renderUI({
+    req(numStdValues(), row_averages())
+    #print(paste0("numStdValues(): ", numStdValues()))
+    num_points <- numStdValues()
+    averages <- row_averages()
+    fluidRow(
+      column(6, strong("Average Signal")),
+      column(6, strong("Standardized Value")),
+      lapply(1:num_points, function(i) {
+        fluidRow(
+          column(6, strong(round(averages[[i]], 2))),
+          column(6, numericInput(paste0("std_value_", i), NULL, value = NULL))
+        )
+      })
+    )
+  })
+  
+  # Receive standard curve values from user
+  std_curve_inputs <- reactive({
+    num_points <- numStdValues()
+    sapply(1:num_points, function(i) input[[paste0("std_value_", i)]])
+  })
+
+  # Reactive to create data frame for standard curve
+  combined_curve_data <- reactive({
+    req(row_averages(), std_curve_inputs())
+    data.frame(
+      Signal = row_averages(),
+      Standardized_Value = std_curve_inputs()
+    )
+  })
+  
+  # Function to remove outliers based on Value within each Sample group using Grubbs' test
+  remove_outliers <- function(data) {
+    # Initialize an empty data frame to collect outliers
+    outliers <- data.frame(Column = integer(), Value = numeric(), Row = integer(), Sample = character())
+  
+    # Process data grouped by Sample
+    data_clean <- data %>%
+      group_by(Sample) %>%
+      mutate(`Sample Group` = cur_group()$Sample)
+    
+      data_clean <- data_clean %>% group_modify(~ {
+        sample_data <- .x 
+        # Perform Grubbs' test if there are more than 2 data points
+        if (nrow(sample_data) > 2) {
+          p_value <- 0.05
+          test <- grubbs.test(sample_data$Value)
+  
+          while (test$p.value < p_value) {
+            # Identify the outlier
+            outlier_index <- which.max(abs(sample_data$Value - mean(sample_data$Value)))
+            outlier <- sample_data[outlier_index,]
+            outliers <<- rbind(outliers, outlier)
+  
+            # Remove the identified outlier
+            sample_data <- sample_data[-outlier_index,]
+            # Break if there are not enough data points left for Grubbs' test
+            if (nrow(sample_data) <= 2) break
+            # Re-run Grubbs' test on the remaining data
+            test <- grubbs.test(sample_data$Value)
+          }
+        }
+        return(sample_data)
+      })
+  
+    # Update the reactive value for removed outliers
+    removed_outliers(outliers)
+  
+    return(data_clean)
+  }
+
+  # Render the removed outliers in a DataTable
+  output$outliers_table <- renderDT({
+    req(removed_outliers())
+    datatable(removed_outliers())
+  })
+  
+  # Reactive expression for the linear model
+  standard_curve_model <- reactive({
+    req(combined_curve_data())
+    data <- combined_curve_data()
+    if (input$logX) {
+      lm(Signal ~ log(Standardized_Value), data = data)
+    } else {
+      lm(Signal ~ Standardized_Value, data = data)
+    }
+  })
+  
+  # Render the linear model summary in the Shiny app
+  output$modelSummary <- renderPrint({
+    req(standard_curve_model())
+    summary(standard_curve_model())
+  })
+  
+  # Render data table for curve data
+  output$combined_curve_table <- renderDT({
+    req(combined_curve_data())
+    datatable(combined_curve_data())
+  })
+
+  
+
+
+  # Reactive expression to calculate selected values with background subtraction
+  selected_values <- reactive({
+    req(curve_cells_df(), uploaded_data())
+    data_matrix <- uploaded_data()
+    curve_cells <- curve_cells_df()
+    sapply(1:nrow(curve_cells), function(i) {
+      value <- as.numeric(data_matrix[curve_cells$row[i], curve_cells$col[i]])
+      if (background_subtraction()) {
+        value <- value - background_value()
+      }
+      value
+    })
+  })
+
+  # Update row averages based on selected values
+  observe({
+    req(selected_values())
+    curve_cells <- curve_cells_df()
+    selected_values <- selected_values()
+    selected_cells_df <- data.frame(row = curve_cells$row, col = curve_cells$col, value = selected_values)
+    row_avg <- tapply(selected_cells_df$value, selected_cells_df$row, mean)
+    row_averages(row_avg)
+  })
+  
+
+  # Reactive expression to calculate final values
+  combined_data <- reactive({
+    req(uploaded_data())
+    uploaded_data_matrix <- uploaded_data()
+    plate_map_matrix <- plate_map_data()
+
+    # Convert the uploaded data to a data frame
+    uploaded_data_df <- as.data.frame(uploaded_data_matrix)
+    rownames(uploaded_data_df) <- NULL  # Remove row names
+
+    # Reshape the uploaded data into a long format
+    uploaded_data_long <- uploaded_data_df %>%
+      pivot_longer(cols = everything(), names_to = "Column", values_to = "Value") %>%
+      mutate(Row = rep(1:8, each = 12))  # Add row numbers
+
+    # Convert the plate map data to a data frame and remove row names
+    plate_map_df <- as.data.frame(plate_map_matrix)
+    rownames(plate_map_df) <- NULL  # Remove row names
+
+    # Reshape the plate map data into a long format
+    plate_map_long <- plate_map_df %>%
+      pivot_longer(cols = everything(), names_to = "Column", values_to = "Sample") %>%
+      mutate(Row = rep(1:8, each = 12))  # Add row numbers
+
+    # Bind the data together by row and column
+    combined_data <- bind_cols(uploaded_data_long, plate_map_long %>% select(Sample))
+
+    # Rename the columns of the combined data frame
+    colnames(combined_data) <- c("Column", "Value", "Row", "Sample")
+
+    combined_data 
+  })
+  
+  final_combined_data <- reactive({
+    req(combined_data())
+    final_data <- combined_data() %>%
+      filter(!is.na(Sample) & Sample != "" & !Sample %in% c("BACKGROUND", "STANDARD", "ZERO", "HUNDRED"))
+    
+    # Determine outliers and remove from dataframe, using Grubbs test
+    final_data <- remove_outliers(final_data) %>% select(-`Sample Group`)
+    
+    # Calculate finalValue IF background TRUE
+    if (background_subtraction()) {
+      final_data <- final_data %>%
+        mutate(finalValue = Value - background_value())
+    } else {
+      final_data <- final_data %>%
+        mutate(finalValue = Value)
+    }
+    
+    # Calculate finalValue IF curve TRUE
+    if (input$stdExist) {
+      print("CURVY")
+      str(standard_curve_model())
+      model_coef <- coef(standard_curve_model())
+      intercept <- model_coef[1]
+      slope <- model_coef[2]
+      print(intercept)
+      print(slope)
+      if (input$logX) {
+        final_data <- final_data %>%
+          mutate(finalValue = exp((finalValue-intercept)/slope))
+      } else {
+        final_data <- final_data %>% 
+          mutate(finalValue = (finalValue-intercept)/slope)
+      }
+        #mutate(finalValue = predict(standard_curve_model(), newdata = data.frame(Standardized_Value = ifelse(input$logX, log(finalValue), finalValue)))) this never worked but it gets to stay
+    }
+    
+    if (input$percentReduction) {
+      print("AW YEAH PERCENTAGE")
+      print(zeroSignal_value)
+      print(hundredSignal_value)
+      
+      zero <- zeroSignal_value()
+      hundred <- hundredSignal_value()
+      
+      final_data <- final_data %>%
+        mutate(finalValue = (finalValue - zero) / (hundred - zero))
+    }
+    
+    final_data
+  })
+
+  # Display the combined data in a DataTable
+  output$combined_data <- renderDT({
+    datatable(final_combined_data())
+  })
+
+  # Create summary dataframe with group average and t tests against the user-defined reference
+  summary_data <- reactive({
+    req(final_combined_data())
+    
+    # Calculate the mean and standard deviation for each sample
+    summary_data <- final_combined_data() %>%
+      group_by(Sample) %>%
+      summarise(
+        Average = mean(finalValue, na.rm = TRUE),
+        `Standard Deviation` = population_sd(finalValue)
+      )
+    
+    # Reference group data
+    reference_data <- final_combined_data() %>%
+      filter(Sample == input$reference_select) %>%
+      pull(finalValue)
+    
+    # Calculate p-values against the reference using t-test
+    summary_data <- summary_data %>%
+      mutate(
+        `p-value (t-test)` = sapply(Sample, function(sample) {
+          # Sample data
+          sample_data <- final_combined_data() %>%
+            filter(Sample == sample) %>%
+            pull(finalValue)
+          
+          # Perform t-test and get p-value
+          if (length(sample_data) > 1 && length(reference_data) > 1) {
+            t_test_result <- t.test(sample_data, reference_data)
+            p_value <- t_test_result$p.value
+          } else {
+            p_value <- NA
+          }
+          p_value
+        })
+      )
+    
+    # Run One-Way ANOVA
+    anova_result <- aov(finalValue ~ Sample, data = final_combined_data())
+    
+    # Perform Tukey HSD test
+    tukey_result <- TukeyHSD(anova_result)
+    
+    # Convert Tukey HSD result to a data frame
+    tukey_df <- as.data.frame(tukey_result$Sample)
+    tukey_df$comparison <- rownames(tukey_df)  # Add comparison names as a column
+    
+    # Filter for comparisons involving the reference group
+    reference_group <- input$reference_select
+    filtered_tukey_df <- tukey_df %>%
+      filter(grepl(reference_group, comparison)) %>%
+      separate(comparison, into = c("Group1", "Group2"), sep = "-")
+    
+      # Integrate Tukey HSD p-values into summary_data
+    summary_data <- summary_data %>%
+        mutate(
+          `p-value (Tukey HSD)` = sapply(Sample, function(sample) {
+            if (sample == reference_group) {
+              return("1")  # No comparison for the reference group itself, explicitly return NA as numeric
+            } else {
+              # Find the exact match in filtered_tukey_df
+              match_row <- filtered_tukey_df %>%
+                filter((Group1 == sample & Group2 == reference_group) |
+                       (Group1 == reference_group & Group2 == sample))
+              # Ensure only one match is found
+              if (nrow(match_row) == 1) {
+                return(as.numeric(match_row$`p adj`))  # Return the p-value as numeric
+              } else {
+                # Handle cases where no exact match or multiple matches are found
+                warning(paste("Unexpected match for sample:", sample))
+                return(NA_real_)  # If no match is found, return NA as numeric
+              }
+            }
+          })
+
+        ) %>%
+      mutate(
+             # Format Average and Standard Deviation to 4 decimal places
+          Average = formatC(Average, format = "f", digits = 4),
+          `Standard Deviation` = formatC(`Standard Deviation`, format = "f", digits = 4),
+          # Format p-values to 6 decimal places
+          `p-value (t-test)` = formatC(`p-value (t-test)`, format = "f", digits = 6),
+          `p-value (Tukey HSD)` = formatC(as.numeric(`p-value (Tukey HSD)`, format = "f", digits = 6))
+      )
+    
+    
+    
+    # Order the Sample column based on input$ranked_samples
+    summary_data$Sample <- factor(summary_data$Sample, levels = input$ranked_samples)
+    
+    # Sort the summary_data by the ordered Sample column
+    summary_data <- summary_data[order(summary_data$Sample), ]
+    
+    # Print the summary_data to check if Tukey HSD p-values are added
+    # print(summary_data)
+    
+    summary_data
+  })
+
+  output$summary_table <- renderDT({
+    req(summary_data())
+    datatable(summary_data())
+  })
+  
+  # Download handler for summary data
+  output$exportSummary <- downloadHandler(
+    filename = function() {
+      paste("summary_data_", Sys.Date(), ".csv", sep = "")
+    },
+    content = function(file) {
+      write.csv(summary_data(), file, row.names = FALSE)
+    }
+  )
+
+  ### GRAPHING #######
+
+  # Calculate averages of each sample in sample_list and create the bar chart
+  output$barChart <- renderPlot({
+    req(final_combined_data())
+    
+    # Use raw data for plotting and statistical test
+    plot_data <- final_combined_data() %>%
+      filter(Sample %in% sample_list())
+  
+    # Reorder Sample levels based on ranked_groups
+    plot_data$Sample <- factor(plot_data$Sample, levels = input$ranked_samples)
+    
+    # Create the bar chart with error bars and statistical comparison
+    ggplot(plot_data, aes(x = Sample, y = finalValue, fill = Sample)) +
+      # Calculate means and standard deviations for the plot
+      stat_summary(fun = mean, geom = "bar", position = position_dodge(), width = 0.8) +
+      stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, position = position_dodge(.8)) +
+      # Perform the t-test and display significance
+      stat_compare_means(method = "t.test", ref.group = input$reference_select, label = "p.signif", hide.ns = TRUE, size = 7) +
+      theme_minimal() +
+      ggtitle(input$plot_title) +  
+      xlab(input$x_axis_title) +   
+      ylab(input$y_axis_title) +
+      theme(
+        plot.title = element_text(size = 20, face = "bold"), 
+        axis.title.x = element_text(size = 24),              
+        axis.title.y = element_text(size = 16)              
+      )
+  })
+  
+  population_sd <- function(x) {
+  sqrt(sum((x - mean(x, na.rm = TRUE))^2, na.rm = TRUE) / length(x[!is.na(x)]))
+}
+
+
+}
+
+shinyApp(ui = ui_PlatemapAnalyzer_V7, server = server_PlatemapAnalyzer_V7, options = list(width = '140%', height = '14000px'))
+```
+
