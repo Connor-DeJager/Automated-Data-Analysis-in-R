@@ -22,9 +22,7 @@ library(shinyjs)
 library(rsconnect)
 library(renv)
 library(stats)
-
-
-
+library(EnvStats)
 ```
 
 
@@ -462,7 +460,7 @@ observeEvent(input$select_curve_values, {
   })
   
   # Function to remove outliers based on Value within each Sample group using Grubbs' test
-  remove_outliers <- function(data) {
+  remove_outliersOLD <- function(data) {
     # Initialize an empty data frame to collect outliers
     outliers <- data.frame(Column = integer(), Value = numeric(), Row = integer(), Sample = character())
   
@@ -501,6 +499,51 @@ observeEvent(input$select_curve_values, {
     return(data_clean)
   }
 
+  remove_outliers <- function(data) {
+    # Initialize an empty data frame to collect outliers
+    outliers <- data.frame(Column = integer(), Value = numeric(), Row = integer(), Sample = character())
+    
+    # Process data grouped by Sample
+    data_clean <- data %>%
+      group_by(Sample) %>%
+      mutate(`Sample Group` = cur_group()$Sample)
+    
+    data_clean <- data_clean %>% group_modify(~ {
+      sample_data <- .x 
+      
+      # Perform Rosner's ESD test if there are more than 2 data points
+      if (nrow(sample_data) > 2) {
+        # Calculate k as one-third of the number of data points (rounded down)
+        k_value <- floor(nrow(sample_data) / 3)
+        
+        # Only run Rosner's ESD test if k_value is at least 1
+        if (k_value > 0) {
+          # Run Rosner's test for up to k_value outliers
+          rosner_test <- rosnerTest(sample_data$Value, k = k_value)
+          
+          # Identify outliers based on Rosner's results
+          outlier_indices <- rosner_test$all.stats$Obs.Num[rosner_test$all.stats$Outlier]
+          
+          if (length(outlier_indices) > 0) {
+            outlier_rows <- sample_data[outlier_indices, ]
+            outliers <<- rbind(outliers, outlier_rows)
+            
+            # Remove identified outliers from the sample_data
+            sample_data <- sample_data[-outlier_indices, ]
+          }
+        }
+      }
+      return(sample_data)
+    })
+    
+    # Update the reactive value for removed outliers
+    removed_outliers(outliers)
+    
+    return(data_clean)
+  }
+
+  
+
   # Render the removed outliers in a DataTable
   output$outliers_table <- renderDT({
     req(removed_outliers())
@@ -530,9 +573,6 @@ observeEvent(input$select_curve_values, {
     datatable(combined_curve_data())
   })
 
-  
-
-
   # Reactive expression to calculate selected values with background subtraction
   selected_values <- reactive({
     req(curve_cells_df(), uploaded_data())
@@ -557,7 +597,6 @@ observeEvent(input$select_curve_values, {
     row_averages(row_avg)
   })
   
-
   # Reactive expression to calculate final values
   combined_data <- reactive({
     req(uploaded_data())
@@ -732,8 +771,6 @@ observeEvent(input$select_curve_values, {
           `p-value (Tukey HSD)` = formatC(as.numeric(`p-value (Tukey HSD)`, format = "f", digits = 6))
       )
     
-    
-    
     # Order the Sample column based on input$ranked_samples
     summary_data$Sample <- factor(summary_data$Sample, levels = input$ranked_samples)
     
@@ -764,7 +801,7 @@ observeEvent(input$select_curve_values, {
   ### GRAPHING #######
 
   # Calculate averages of each sample in sample_list and create the bar chart
-  output$barChart <- renderPlot({
+  output$barChartOLD <- renderPlot({
     req(final_combined_data())
     
     # Use raw data for plotting and statistical test
@@ -791,6 +828,43 @@ observeEvent(input$select_curve_values, {
         axis.title.y = element_text(size = 16)              
       )
   })
+  
+output$barChart <- renderPlot({
+  req(summary_data(), final_combined_data())
+  
+  # Get the summary data from the reactive summary_data()
+  plot_summary <- summary_data()
+  
+  # Ensure column names are correct and convert to numeric
+  plot_summary <- plot_summary %>%
+    mutate(
+      Average = as.numeric(Average),
+      `Standard Deviation` = as.numeric(`Standard Deviation`)
+    )
+  
+  # Create the bar chart with SD as error bars
+  ggplot() +
+    # Plot the bar chart from the summary data
+    geom_bar(data = plot_summary, aes(x = Sample, y = Average, fill = Sample), 
+             stat = "identity", position = position_dodge(), width = 0.8) +
+    geom_errorbar(data = plot_summary, aes(x = Sample, ymin = Average - `Standard Deviation`, 
+                                           ymax = Average + `Standard Deviation`), 
+                  width = 0.2, position = position_dodge(0.8)) +
+    # Add statistical comparisons using the raw data
+    stat_compare_means(data = final_combined_data(), aes(x = Sample, y = finalValue),
+                       method = "t.test", ref.group = input$reference_select, 
+                       label = "p.signif", hide.ns = TRUE, size = 7) +
+    theme_minimal() +
+    ggtitle(input$plot_title) +  
+    xlab(input$x_axis_title) +   
+    ylab(input$y_axis_title) +
+    theme(
+      plot.title = element_text(size = 20, face = "bold"), 
+      axis.title.x = element_text(size = 24),              
+      axis.title.y = element_text(size = 16)              
+    )
+})
+
   
   population_sd <- function(x) {
   sqrt(sum((x - mean(x, na.rm = TRUE))^2, na.rm = TRUE) / length(x[!is.na(x)]))
