@@ -1,3 +1,27 @@
+---
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(data.table)
+library(shiny)
+library(DT)
+library(rlang)
+library(ggsignif)
+library(outliers)
+library(ggpubr)
+library(sortable)
+library(rsconnect)
+library(renv)
+library(shiny)
+library(EnvStats)
+```
+
 ```{r, echo = FALSE, results = 'asis'}
 
 ## DEFINE SHINY UI ######  
@@ -71,7 +95,6 @@ ui2 <- fluidPage(
 server <- function(input, output, session) {
   
   ## OUTPUT MANAGEMENT ######################
-
 
   # Reactive to store selected housekeeping gene
   HKgeneName <- reactive({
@@ -206,6 +229,7 @@ server <- function(input, output, session) {
   
     # Remove rows with any missing data
     final_data <- final_data %>% filter(complete.cases(.))
+    print(final_data)
     return(final_data)
   })
   
@@ -308,51 +332,54 @@ server <- function(input, output, session) {
   outlier_data <- data.frame()
   summarized_data <- data.frame()
   
-  for(sample in unique_samples) {
-    for(gene in unique_genes) {
+for(sample in unique_samples) {
+  for(gene in unique_genes) {
+    
+    # Filter data for the current sample and gene
+    temp_data <- data %>%
+      filter(Cleaner_Sample_Name == sample) %>%
+      filter(Gene == gene)
+    
+    # Calculate k as half the number of rows in temp_data (rounded down)
+    k_value <- floor(nrow(temp_data) / 3)
+    
+    # Only run Rosner's ESD test if k_value is at least 1
+    if (k_value > 0) {
       
-      # Filter data for the current sample and gene, ensuring numeric conversion
-      temp_data <- data %>%
-        filter(Cleaner_Sample_Name == sample) %>%
-        filter(Gene == gene)
+      # Run Rosner's test for up to k_value outliers
+      rosner_test <- rosnerTest(temp_data$ddCT, k = k_value)
       
-      # only run Grubbs if there are 3 or more values
-      if (nrow(temp_data) > 2) {
-        grubbs_test <- grubbs.test(temp_data$ddCT, two.sided = TRUE)
-        outlier_value <- 0
-        
-      # All this executes while there is outlier in the group (p < 0.05)
-      while(grubbs_test$p.value < 0.05) {
-        
-          # Placing the outlier value in a variable based on whether the outlier is high / low
-          if (grepl("highest value", grubbs_test$alternative)) {
-            outlier_value <- max(temp_data$ddCT)
-          } else {
-            outlier_value <- min(temp_data$ddCT)
-          }
-
-          # adds outlier row to outlier_data dataframe
-          outlier_row <- temp_data %>% filter(ddCT == outlier_value)
-          outlier_data <- rbind(outlier_data, outlier_row)
-                          
-          # filters the row with the outlier out of temp data 
-          temp_data <- temp_data %>% filter(ddCT != outlier_value)
-          
-          if (nrow(temp_data) > 2) {
-            grubbs_test <- grubbs.test(temp_data$ddCT, two.sided = TRUE)
-          } else { break }
-        }
-        
-      }
-      stat_data <- rbind(stat_data, temp_data)
+      # Print Block for Dx
+      #print("ROSNER TEST: ")
+      #print(sample)
+      #print(temp_data$ddCT)
+      #print(rosner_test)
+      #print("...")
+      #
       
-      summary_row <- temp_data %>%
-        summarize(Cleaner_Sample_Name = unique(Cleaner_Sample_Name),
-          Gene = unique(Gene),
-          FoldChange = formatC(mean(FoldChange, na.rm = TRUE), digits=3))
-      summarized_data <- rbind(summarized_data, summary_row)
+      # Identify outliers based on Rosner's results
+      outlier_indices <- rosner_test$all.stats$Obs.Num[rosner_test$all.stats$Outlier]
+      outlier_values <- temp_data$ddCT[outlier_indices]
+      
+      # Add the outlier rows to the outlier_data dataframe
+      outlier_rows <- temp_data %>% filter(ddCT %in% outlier_values)
+      outlier_data <- rbind(outlier_data, outlier_rows)
+      
+      # Filter the outliers out of temp_data
+      temp_data <- temp_data %>% filter(!ddCT %in% outlier_values)
     }
+    
+    # Add remaining data to stat_data
+    stat_data <- rbind(stat_data, temp_data)
+    
+    # Summarize results for this sample and gene
+    summary_row <- temp_data %>%
+      summarize(Cleaner_Sample_Name = unique(Cleaner_Sample_Name),
+                Gene = unique(Gene),
+                FoldChange = formatC(mean(FoldChange, na.rm = TRUE), digits=3))
+    summarized_data <- rbind(summarized_data, summary_row)
   }
+}
   
   return(list(stat_data = stat_data, outlier_data = outlier_data, summarized_data = summarized_data))
   })
@@ -653,3 +680,5 @@ population_sd <- function(x) {
 # Run the application
 shinyApp(ui = ui2, server = server, options = list(width = '130%', height = '14000px'))
 ```
+
+
